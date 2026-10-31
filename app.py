@@ -1,8 +1,10 @@
-import streamlit as st
 import math
+import re
 from pathlib import Path
 
 import joblib
+import sklearn
+import streamlit as st
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -312,29 +314,62 @@ LABEL_MAP = {
     "positive": ("Positif", "😊", "pos"),
     "negative": ("Negatif", "😞", "neg"),
     "neutral":  ("Netral",  "😐", "neu"),
-    "pos":      ("Positif", "😊", "pos"),
-    "neg":      ("Negatif", "😞", "neg"),
-    "neu":      ("Netral",  "😐", "neu"),
 }
+
 
 def normalize_label(raw, classes=None) -> str:
     label = str(raw).lower().strip()
-    if "pos" in label:   return "positive"
-    if "neg" in label:   return "negative"
-    if "neu" in label:   return "neutral"
-    if "positif" in label: return "positive"
-    if "negatif" in label: return "negative"
-    if "netral" in label: return "neutral"
+    if "pos" in label:
+        return "positive"
+    if "neg" in label:
+        return "negative"
+    if "neu" in label or "netral" in label:
+        return "neutral"
 
     numeric_label = label.removeprefix("label_")
     if numeric_label in ("0", "1", "2"):
         numeric_classes = {str(value).lower() for value in classes or []}
         if numeric_classes == {"0", "1"}:
             return "negative" if numeric_label == "0" else "positive"
-        if numeric_label == "0": return "negative"
-        if numeric_label == "1": return "neutral"
-        if numeric_label == "2": return "positive"
+        if numeric_label == "0":
+            return "negative"
+        if numeric_label == "1":
+            return "neutral"
+        if numeric_label == "2":
+            return "positive"
     return "neutral"
+
+
+# ─── Preprocessing ────────────────────────────────────────────────────────────
+# PENTING: fungsi ini HARUS sama dengan preprocessing di notebook yang
+# menghasilkan kolom `komen_clean` (urutan, regex, dan library-nya).
+# Kalau beda, masukan ke model berbeda dari saat pelatihan dan hasilnya melenceng.
+@st.cache_resource(show_spinner=False)
+def load_nlp():
+    from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
+    from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
+
+    stemmer = StemmerFactory().create_stemmer()
+    stopper = StopWordRemoverFactory().create_stop_word_remover()
+    return stemmer, stopper
+
+
+def preprocess(text: str) -> str:
+    stemmer, stopper = load_nlp()
+
+    # 1) cleaning: URL, mention, angka, tanda baca, karakter khusus
+    text = re.sub(r"http\S+|www\.\S+", " ", text)
+    text = re.sub(r"@\w+", " ", text)
+    text = re.sub(r"\d+", " ", text)
+    # 2) case folding
+    text = text.lower()
+    text = re.sub(r"[^a-z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # 3) tokenization + 4) stopword removal (Sastrawi)
+    text = stopper.remove(text)
+    # 5) stemming (Sastrawi)
+    return stemmer.stem(text).strip()
+
 
 # ─── Model loader (cached) ────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
@@ -346,8 +381,10 @@ def load_vectorizer():
 def load_model(model_name: str):
     return joblib.load(MODEL_DIR / MODELS[model_name])
 
+
 # ─── Inference ────────────────────────────────────────────────────────────────
 def decision_distribution(model, features, classes):
+    """Skor relatif (softmax dari decision_function). BUKAN probabilitas asli."""
     decisions = model.decision_function(features)
     if getattr(decisions, "ndim", 1) == 2:
         decisions = decisions[0]
@@ -363,33 +400,34 @@ def decision_distribution(model, features, classes):
     return decisions, probabilities
 
 
-def predict(vectorizer, model, text: str) -> dict:
-    features = vectorizer.transform([text])
+def predict(vectorizer, model, clean_text: str) -> dict:
+    features = vectorizer.transform([clean_text])
     classes = list(getattr(model, "classes_", []))
-    is_svc = model.__class__.__name__ == "SVC"
 
-    if is_svc and hasattr(model, "decision_function"):
-        decisions, probabilities = decision_distribution(model, features, classes)
-        predicted_label = classes[max(range(len(decisions)), key=decisions.__getitem__)]
+    # Label SELALU dari model.predict (sama dengan yang dievaluasi di penelitian)
+    predicted_label = model.predict(features)[0]
+    if not classes:
+        classes = [predicted_label]
+
+    approx = False
+    if hasattr(model, "predict_proba"):
+        probabilities = model.predict_proba(features)[0]
+    elif hasattr(model, "decision_function"):
+        _, probabilities = decision_distribution(model, features, classes)
+        approx = True  # persentase = skor relatif, bukan probabilitas
     else:
-        predicted_label = model.predict(features)[0]
-        if not classes:
-            classes = [predicted_label]
-
-        if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(features)[0]
-        elif hasattr(model, "decision_function"):
-            _, probabilities = decision_distribution(model, features, classes)
-        else:
-            probabilities = [1.0 if label == predicted_label else 0.0 for label in classes]
+        probabilities = [1.0 if label == predicted_label else 0.0 for label in classes]
 
     scores = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
     for label, probability in zip(classes, probabilities):
-        canonical = normalize_label(label, classes)
-        scores[canonical] += float(probability)
+        scores[normalize_label(label, classes)] += float(probability)
 
-    predicted = normalize_label(predicted_label, classes)
-    return {"scores": scores, "predicted": predicted}
+    return {
+        "scores": scores,
+        "predicted": normalize_label(predicted_label, classes),
+        "approx": approx,
+    }
+
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -418,11 +456,17 @@ for start in range(0, len(model_items), 3):
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+
 # ── Text input ────────────────────────────────────────────────────────────────
+def clear_text():
+    st.session_state["user_text"] = ""
+
+
 user_text = st.text_area(
     "📝 Masukkan teks untuk dianalisis",
     placeholder="Ketik atau paste teks bahasa Indonesia di sini…",
     height=140,
+    key="user_text",
 )
 
 model_options = ["Semua model", *MODELS.keys()]
@@ -436,16 +480,47 @@ with c1:
         f"🔍 Analisis Sentimen dengan {model_label}", use_container_width=True
     )
 with c2:
-    clear_btn = st.button("🗑️ Bersihkan", use_container_width=True)
-
-if clear_btn:
-    st.rerun()
+    st.button("🗑️ Bersihkan", use_container_width=True, on_click=clear_text)
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 if run_btn:
     if not user_text.strip():
         st.warning("Silakan masukkan teks terlebih dahulu.")
     else:
+        # Preprocessing (sekali saja untuk semua model)
+        try:
+            clean = preprocess(user_text.strip())
+        except Exception as e:
+            st.error(
+                "Preprocessing gagal. Pastikan library Sastrawi terpasang "
+                f"(pip install Sastrawi). Detail: {e}"
+            )
+            st.stop()
+
+        st.caption(f"Teks setelah preprocessing: `{clean if clean else '(kosong)'}`")
+        if not clean:
+            st.warning(
+                "Teks menjadi kosong setelah preprocessing (misalnya hanya berisi "
+                "stopword atau simbol), jadi tidak bisa dianalisis."
+            )
+            st.stop()
+
+        # Info teknis untuk debugging
+        try:
+            vec = load_vectorizer()
+            vocab = getattr(vec, "vocabulary_", {})
+            tokens = clean.split()
+            missing = [t for t in tokens if t not in vocab]
+            with st.expander("🔧 Info teknis (untuk pengecekan)"):
+                st.write(f"Jumlah fitur vectorizer: **{len(vocab)}** (di penelitian: 5000)")
+                st.write(f"Versi scikit-learn: **{sklearn.__version__}**")
+                st.write(
+                    "Kata yang tidak ada di fitur (diabaikan model): "
+                    + (", ".join(f"`{t}`" for t in missing) if missing else "tidak ada")
+                )
+        except Exception:
+            pass
+
         results = {}
         progress = st.progress(0, text="Memuat model dan menganalisis…")
 
@@ -454,7 +529,7 @@ if run_btn:
                 try:
                     vectorizer = load_vectorizer()
                     model = load_model(model_name)
-                    results[model_name] = predict(vectorizer, model, user_text.strip())
+                    results[model_name] = predict(vectorizer, model, clean)
                 except Exception as e:
                     results[model_name] = {"error": str(e)}
             progress.progress(
@@ -469,94 +544,103 @@ if run_btn:
             counts = {"positive": 0, "negative": 0, "neutral": 0}
             for v in valid.values():
                 counts[v["predicted"]] += 1
-            consensus = max(counts, key=counts.get)
-            avg_conf = sum(v["scores"][v["predicted"]] for v in valid.values()) / len(valid)
-            agree_n = counts[consensus]
-            total_n = len(valid)
 
-            name_c, emoji_c, css_c = LABEL_MAP.get(consensus, (consensus, "🤔", "neu"))
-            all_agree = agree_n == total_n
+            top = max(counts.values())
+            winners = [k for k, v in counts.items() if v == top]
+            total_n = len(valid)
+            avg_conf = sum(v["scores"][v["predicted"]] for v in valid.values()) / total_n
+
+            if len(winners) == 1:
+                consensus = winners[0]
+                name_c, emoji_c, css_c = LABEL_MAP[consensus]
+                if top == total_n:
+                    detail = f"Semua {total_n} model sepakat"
+                else:
+                    detail = f"{top} dari {total_n} model memilih {name_c}"
+            else:
+                name_c = "Seri: " + " / ".join(LABEL_MAP[w][0] for w in winners)
+                emoji_c, css_c = "⚖️", "neu"
+                detail = f"Suara terbagi ({top} suara per kelas dari {total_n} model)"
 
             st.markdown(f"""
             <div class="consensus-box">
               <div class="c-label">Kesepakatan Model</div>
               <div class="c-result c-{css_c}">{emoji_c} {name_c}</div>
               <div class="c-detail">
-                {"Semua " + str(total_n) + " model sepakat" if all_agree
-                 else str(agree_n) + " dari " + str(total_n) + " model memilih " + name_c}
-                 &nbsp;•&nbsp; Rata-rata kepercayaan: {avg_conf*100:.1f}%
+                {detail} &nbsp;•&nbsp; Rata-rata kepercayaan: {avg_conf*100:.1f}%
               </div>
             </div>
             """, unsafe_allow_html=True)
 
         st.markdown(f"### 📊 Hasil pengujian: {', '.join(selected_models)}")
 
+        if any(v.get("approx") for v in valid.values()):
+            st.caption(
+                "Catatan: model tanpa probabilitas (misalnya SVM) menampilkan skor relatif "
+                "(softmax dari decision function), bukan probabilitas asli. "
+                "Label tetap berasal dari model.predict."
+            )
+
         # ── Individual cards ──────────────────────────────────────────────────
         for model_name, res in results.items():
             repo = MODELS[model_name]
             short_repo = ("…" + repo[-38:]) if len(repo) > 40 else repo
 
-            with st.container():
-                st.markdown("""<div class="result-card-wrap">""", unsafe_allow_html=True)
-
-                if "error" in res:
-                    st.markdown(f"""
-                    <div class="result-card" style="border-color:rgba(239,68,68,0.3)">
-                      <div class="rc-header">
-                        <div><div class="rc-model">{model_name}</div>
-                        <div class="rc-repo">{short_repo}</div></div>
-                        <span class="badge-neg">⚠ Error</span>
-                      </div>
-                      <p style="color:#ef4444;font-size:0.82rem;margin:0">{res['error']}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    continue
-
-                pred = res["predicted"]
-                s = res["scores"]
-                lname, lemoji, lcss = LABEL_MAP.get(pred, (pred, "🤔", "neu"))
-
-                # Card header (HTML — no inline width needed here)
+            if "error" in res:
                 st.markdown(f"""
-                <div class="result-card-header">
-                  <div>
-                    <div class="rc-model">{model_name}</div>
-                    <div class="rc-repo">{short_repo}</div>
+                <div class="result-card" style="border-color:rgba(239,68,68,0.3)">
+                  <div class="rc-header">
+                    <div><div class="rc-model">{model_name}</div>
+                    <div class="rc-repo">{short_repo}</div></div>
+                    <span class="badge-neg">⚠ Error</span>
                   </div>
-                  <span class="badge-{lcss}">{lemoji} {lname}</span>
+                  <p style="color:#ef4444;font-size:0.82rem;margin:0">{res['error']}</p>
                 </div>
                 """, unsafe_allow_html=True)
+                continue
 
-                # Confidence bars — use st.progress (native, always renders)
-                bar_data = [
-                    ("😊 Positif", s["positive"], "#22c55e"),
-                    ("😞 Negatif", s["negative"], "#ef4444"),
-                    ("😐 Netral",  s["neutral"],  "#60a5fa"),
-                ]
-                for blabel, bval, _ in bar_data:
-                    pct = bval * 100
-                    col_label, col_bar, col_pct = st.columns([1.2, 6, 1])
-                    with col_label:
-                        st.markdown(
-                            f"<div style='color:#8892b0;font-size:0.78rem;"
-                            f"font-weight:600;padding-top:6px'>{blabel}</div>",
-                            unsafe_allow_html=True
-                        )
-                    with col_bar:
-                        st.progress(bval)
-                    with col_pct:
-                        st.markdown(
-                            f"<div style='color:#d1d5db;font-size:0.82rem;"
-                            f"font-weight:700;padding-top:6px;text-align:right'>{pct:.1f}%</div>",
-                            unsafe_allow_html=True
-                        )
+            pred = res["predicted"]
+            s = res["scores"]
+            lname, lemoji, lcss = LABEL_MAP.get(pred, (pred, "🤔", "neu"))
 
-                st.markdown("</div>", unsafe_allow_html=True)
-                st.markdown("<div style='margin-bottom:8px'></div>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="result-card-header">
+              <div>
+                <div class="rc-model">{model_name}</div>
+                <div class="rc-repo">{short_repo}</div>
+              </div>
+              <span class="badge-{lcss}">{lemoji} {lname}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            bar_data = [
+                ("😊 Positif", s["positive"]),
+                ("😞 Negatif", s["negative"]),
+                ("😐 Netral",  s["neutral"]),
+            ]
+            for blabel, bval in bar_data:
+                pct = bval * 100
+                col_label, col_bar, col_pct = st.columns([1.2, 6, 1])
+                with col_label:
+                    st.markdown(
+                        f"<div style='color:#8892b0;font-size:0.78rem;"
+                        f"font-weight:600;padding-top:6px'>{blabel}</div>",
+                        unsafe_allow_html=True,
+                    )
+                with col_bar:
+                    st.progress(min(max(bval, 0.0), 1.0))
+                with col_pct:
+                    st.markdown(
+                        f"<div style='color:#d1d5db;font-size:0.82rem;"
+                        f"font-weight:700;padding-top:6px;text-align:right'>{pct:.1f}%</div>",
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown("<div style='margin-bottom:8px'></div>", unsafe_allow_html=True)
 
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown(
             "<p style='text-align:center;color:#3a4460;font-size:0.75rem'>"
             "SentimentAI — Decision Tree · KNN · Logistic Regression · Naive Bayes · Random Forest · SVM</p>",
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
