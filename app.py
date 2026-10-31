@@ -347,28 +347,41 @@ def load_model(model_name: str):
     return joblib.load(MODEL_DIR / MODELS[model_name])
 
 # ─── Inference ────────────────────────────────────────────────────────────────
+def decision_distribution(model, features, classes):
+    decisions = model.decision_function(features)
+    if getattr(decisions, "ndim", 1) == 2:
+        decisions = decisions[0]
+    elif len(classes) == 2:
+        score = float(decisions[0])
+        decisions = [-score, score]
+
+    decisions = [float(score) for score in decisions]
+    peak = max(decisions)
+    exp_scores = [math.exp(score - peak) for score in decisions]
+    total = sum(exp_scores)
+    probabilities = [score / total for score in exp_scores]
+    return decisions, probabilities
+
+
 def predict(vectorizer, model, text: str) -> dict:
     features = vectorizer.transform([text])
-    predicted_label = model.predict(features)[0]
-    classes = list(getattr(model, "classes_", [predicted_label]))
-
+    classes = list(getattr(model, "classes_", []))
     is_svc = model.__class__.__name__ == "SVC"
-    if hasattr(model, "predict_proba") and not is_svc:
-        probabilities = model.predict_proba(features)[0]
-    elif hasattr(model, "decision_function"):
-        decisions = model.decision_function(features)
-        if getattr(decisions, "ndim", 1) == 2:
-            decisions = decisions[0]
-        elif len(classes) == 2:
-            score = float(decisions[0])
-            decisions = [-score, score]
-        decisions = [float(score) for score in decisions]
-        peak = max(decisions)
-        exp_scores = [math.exp(score - peak) for score in decisions]
-        total = sum(exp_scores)
-        probabilities = [score / total for score in exp_scores]
+
+    if is_svc and hasattr(model, "decision_function"):
+        decisions, probabilities = decision_distribution(model, features, classes)
+        predicted_label = classes[max(range(len(decisions)), key=decisions.__getitem__)]
     else:
-        probabilities = [1.0 if label == predicted_label else 0.0 for label in classes]
+        predicted_label = model.predict(features)[0]
+        if not classes:
+            classes = [predicted_label]
+
+        if hasattr(model, "predict_proba"):
+            probabilities = model.predict_proba(features)[0]
+        elif hasattr(model, "decision_function"):
+            _, probabilities = decision_distribution(model, features, classes)
+        else:
+            probabilities = [1.0 if label == predicted_label else 0.0 for label in classes]
 
     scores = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
     for label, probability in zip(classes, probabilities):
