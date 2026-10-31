@@ -352,7 +352,8 @@ def predict(vectorizer, model, text: str) -> dict:
     predicted_label = model.predict(features)[0]
     classes = list(getattr(model, "classes_", [predicted_label]))
 
-    if hasattr(model, "predict_proba"):
+    is_svc = model.__class__.__name__ == "SVC"
+    if hasattr(model, "predict_proba") and not is_svc:
         probabilities = model.predict_proba(features)[0]
     elif hasattr(model, "decision_function"):
         decisions = model.decision_function(features)
